@@ -32,6 +32,8 @@ class ERICompleteAutomation:
         self.wait = None
         self.actions = None
         self.screenshot_counter = 1
+        self.csv_filename = None
+        self.all_data = []
         
         # Input data (will be parsed from user input)
         self.eri_code = None
@@ -48,7 +50,88 @@ class ERICompleteAutomation:
         print(f"📷 {filename}")
         self.screenshot_counter += 1
 
-    def wait_and_click(self, xpath, description, timeout=15):
+    def parse_multi_input(self, input_data):
+        """Parse multiple rows of input data"""
+        rows = []
+        lines = input_data.strip().split('\n')
+        
+        for line in lines:
+            if line.strip():
+                parts = [part.strip() for part in line.split('\t')]
+                if len(parts) >= 6:
+                    row = {
+                        'eri_code': parts[0],
+                        'location': parts[1],
+                        'revenue': parts[2].replace(',', ''),
+                        'industry': parts[3],
+                        'years_experience': parts[4] if parts[4] != 'N/A' else None,
+                        'data_type': parts[5]
+                    }
+                    rows.append(row)
+        
+        print(f"📋 Parsed {len(rows)} input rows:")
+        for i, row in enumerate(rows, 1):
+            print(f"   Row {i}: ERI {row['eri_code']}, {row['location']}, {row['data_type']}")
+        
+        return rows
+
+    def read_csv_input(self, csv_file_path):
+        """Read input data from CSV file and separate rows that need processing"""
+        all_rows = []
+        rows_to_process = []
+        
+        try:
+            with open(csv_file_path, 'r', newline='', encoding='utf-8') as csvfile:
+                reader = csv.DictReader(csvfile)
+                
+                for row_num, row in enumerate(reader, 1):
+                    data_row = {
+                        'row_index': row_num - 1,  # For tracking original position
+                        'eri_code': row['ERI Code'].strip(),
+                        'location': row['ERI Location'].strip(),
+                        'revenue': row['Revenue'].strip().replace(',', '').replace('"', ''),
+                        'industry': row['Industry'].strip(),
+                        'years_experience': row['Years of Experience'].strip(),
+                        'data_type': row['Requested Type'].strip(),
+                        'existing_answer': row.get('Answer', 'Not Available').strip()
+                    }
+                    
+                    all_rows.append(data_row)
+                    
+                    # Check if this row needs processing
+                    if data_row['existing_answer'] in ['Not Available', '', 'NaN', 'nan']:
+                        rows_to_process.append(data_row)
+                        print(f"   📝 Row {row_num}: ERI {data_row['eri_code']} - NEEDS PROCESSING")
+                    else:
+                        print(f"   ✅ Row {row_num}: ERI {data_row['eri_code']} - HAS ANSWER ({data_row['existing_answer']})")
+                
+                print(f"\n📋 Total rows: {len(all_rows)}")
+                print(f"🔄 Rows to process: {len(rows_to_process)}")
+                print(f"✅ Rows with existing answers: {len(all_rows) - len(rows_to_process)}")
+                
+        except FileNotFoundError:
+            print(f"❌ CSV file not found: {csv_file_path}")
+        except Exception as e:
+            print(f"❌ Error reading CSV file: {e}")
+            
+        return all_rows, rows_to_process
+
+    def wait_and_click_with_retry(self, xpath_list, description):
+        """Try multiple xpath variations until one works"""
+        for i, xpath in enumerate(xpath_list):
+            try:
+                print(f"   🔍 Trying xpath variation {i+1}: {xpath}")
+                element = self.wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
+                print(f"   ✅ Element found with variation {i+1}")
+                element.click()
+                print(f"   ✅ Clicked successfully")
+                return True
+            except Exception as e:
+                print(f"   ❌ Variation {i+1} failed: {str(e)[:50]}...")
+                continue
+        return False
+
+    def wait_and_click(self, xpath, description):
         """Enhanced click method with multiple strategies"""
         print(f"\n🎯 {description}")
         print(f"   XPath: {xpath}")
@@ -57,6 +140,25 @@ class ERICompleteAutomation:
             # Wait for element to be clickable
             element = self.wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
             print("   ✅ Element found")
+            
+            # Try standard click first
+            try:
+                element.click()
+                print("   ✅ Clicked successfully")
+                return True
+            except Exception:
+                # If standard click fails, try JavaScript click
+                print("   ⚠️  Standard click failed, trying JavaScript...")
+                self.driver.execute_script("arguments[0].click();", element)
+                print("   ✅ JavaScript click successful")
+                return True
+                
+        except TimeoutException:
+            print(f"   ❌ Element not found within 15 seconds")
+            return False
+        except Exception as e:
+            print(f"   ❌ Error: {e}")
+            return False
             
             # Scroll into view
             self.driver.execute_script("arguments[0].scrollIntoView(true);", element)
@@ -75,7 +177,7 @@ class ERICompleteAutomation:
                 return True
                 
         except TimeoutException:
-            print(f"   ❌ Element not found within {timeout} seconds")
+            print(f"   ❌ Element not found within 15 seconds")
             return False
         except Exception as e:
             print(f"   ❌ Unexpected error: {e}")
@@ -245,6 +347,16 @@ class ERICompleteAutomation:
         print(f"   Value: '{value}'")
         
         try:
+            # Check and dismiss any mask overlay first
+            try:
+                mask = self.driver.find_element(By.ID, "mask")
+                if mask.is_displayed():
+                    print("   ⚠️  Mask overlay detected, dismissing...")
+                    self.driver.execute_script("document.getElementById('mask').style.display = 'none';")
+                    time.sleep(1)
+            except:
+                pass
+            
             element = self.wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
             print("   ✅ Element found")
             
@@ -270,85 +382,86 @@ class ERICompleteAutomation:
             return False
 
     def extract_years_experience_data(self):
-        """Extract specific data values from the results page"""
-        print("\n📊 Extracting specific data values...")
+        """Extract only the requested data type"""
+        print(f"\n📊 Extracting {self.data_type} data...")
         
         try:
             # Wait for results to load
             time.sleep(3)
             
-            extracted_values = {}
+            result_value = "Not found"
             
-            # 1. Extract All Incumbent Average value
-            try:
-                all_incumbent_xpath = "/html/body/div[1]/div[3]/div[2]/div[1]/div[1]/div[2]/span[3]"
-                all_incumbent_element = self.driver.find_element(By.XPATH, all_incumbent_xpath)
-                all_incumbent_value = all_incumbent_element.text.strip()
-                extracted_values['all_incumbent_average'] = all_incumbent_value
-                print(f"   ✅ All Incumbent Average: {all_incumbent_value}")
-            except Exception as e:
-                print(f"   ❌ Could not extract All Incumbent Average: {e}")
-                extracted_values['all_incumbent_average'] = "Not found"
-            
-            # 2. Find the row with Years of Experience = target value
-            target_years = int(self.years_experience)
-            print(f"   🔍 Looking for Years of Experience = {target_years}")
-            
-            mean_value = "Not found"
-            row_found = False
-            
-            # Search through table rows
-            for row_num in range(1, 20):  # Check up to 20 rows
+            if self.data_type == "All Incumbent Average":
+                # Extract All Incumbent Average
                 try:
-                    # Check Years of Experience column (td[1])
-                    years_xpath = f"/html/body/div[1]/div[3]/div[2]/div[2]/div[1]/div[1]/div[1]/div/div[1]/div[2]/div/div/table/tbody/tr[{row_num}]/td[1]"
-                    years_element = self.driver.find_element(By.XPATH, years_xpath)
-                    years_text = years_element.text.strip()
-                    
-                    print(f"   📋 Row {row_num}: Years = {years_text}")
-                    
-                    # Check if this matches our target years
-                    if years_text == str(target_years):
-                        print(f"   🎯 Found matching row {row_num} for Years = {target_years}")
-                        
-                        # Get Mean value from td[4] for this row
-                        if self.data_type.lower() == "mean":
-                            data_xpath = f"/html/body/div[1]/div[3]/div[2]/div[2]/div[1]/div[1]/div[1]/div/div[1]/div[2]/div/div/table/tbody/tr[{row_num}]/td[4]"
-                        elif "75th" in self.data_type.lower() or "percentile" in self.data_type.lower():
-                            data_xpath = f"/html/body/div[1]/div[3]/div[2]/div[2]/div[1]/div[1]/div[1]/div/div[1]/div[2]/div/div/table/tbody/tr[{row_num}]/td[5]"
-                        else:
-                            data_xpath = f"/html/body/div[1]/div[3]/div[2]/div[2]/div[1]/div[1]/div[1]/div/div[1]/div[2]/div/div/table/tbody/tr[{row_num}]/td[4]"
-                            
-                        try:
-                            data_element = self.driver.find_element(By.XPATH, data_xpath)
-                            mean_value = data_element.text.strip()
-                            print(f"   ✅ {self.data_type} value: {mean_value}")
-                            row_found = True
-                            break
-                        except Exception as e:
-                            print(f"   ❌ Could not extract {self.data_type} value from row {row_num}: {e}")
-                            
-                except NoSuchElementException:
-                    print(f"   ❌ Row {row_num} not found - stopping search")
-                    break
+                    all_incumbent_xpath = "/html/body/div[1]/div[3]/div[2]/div[1]/div[1]/div[2]/span[3]"
+                    all_incumbent_element = self.driver.find_element(By.XPATH, all_incumbent_xpath)
+                    result_value = all_incumbent_element.text.strip()
+                    print(f"   ✅ All Incumbent Average: {result_value}")
                 except Exception as e:
-                    print(f"   ⚠️ Error checking row {row_num}: {e}")
-                    continue
-            
-            if not row_found:
-                print(f"   ❌ Could not find row with Years of Experience = {target_years}")
-            
-            extracted_values['mean_value'] = mean_value
+                    print(f"   ❌ Could not extract All Incumbent Average: {e}")
+                    
+            elif self.data_type in ["Mean", "75th Percentile"]:
+                # Extract from table based on years of experience
+                if self.years_experience is None:
+                    print("   ❌ Years of Experience required for Mean/75th Percentile")
+                    return {
+                        'eri_code': self.eri_code,
+                        'location': self.location,
+                        'industry': self.industry,
+                        'revenue': self.revenue,
+                        'years_experience': 'N/A',
+                        'data_type': self.data_type,
+                        'extracted_value': result_value,
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    }
+                    
+                target_years = int(self.years_experience)
+                print(f"   🔍 Looking for Years of Experience = {target_years}")
+                
+                # Search through table rows
+                for row_num in range(1, 20):  # Check up to 20 rows
+                    try:
+                        # Check Years of Experience column (td[1])
+                        years_xpath = f"/html/body/div[1]/div[3]/div[2]/div[2]/div[1]/div[1]/div[1]/div/div[1]/div[2]/div/div/table/tbody/tr[{row_num}]/td[1]"
+                        years_element = self.driver.find_element(By.XPATH, years_xpath)
+                        years_text = years_element.text.strip()
+                        
+                        print(f"   📋 Row {row_num}: Years = {years_text}")
+                        
+                        # Check if this matches our target years
+                        if years_text == str(target_years):
+                            print(f"   🎯 Found matching row {row_num} for Years = {target_years}")
+                            
+                            # Get value from correct column
+                            if self.data_type == "Mean":
+                                data_xpath = f"/html/body/div[1]/div[3]/div[2]/div[2]/div[1]/div[1]/div[1]/div/div[1]/div[2]/div/div/table/tbody/tr[{row_num}]/td[4]"
+                            elif self.data_type == "75th Percentile":
+                                data_xpath = f"/html/body/div[1]/div[3]/div[2]/div[2]/div[1]/div[1]/div[1]/div/div[1]/div[2]/div/div/table/tbody/tr[{row_num}]/td[5]"
+                                
+                            try:
+                                data_element = self.driver.find_element(By.XPATH, data_xpath)
+                                result_value = data_element.text.strip()
+                                print(f"   ✅ {self.data_type} value: {result_value}")
+                                break
+                            except Exception as e:
+                                print(f"   ❌ Could not extract {self.data_type} value from row {row_num}: {e}")
+                                
+                    except NoSuchElementException:
+                        print(f"   ❌ Row {row_num} not found - stopping search")
+                        break
+                    except Exception as e:
+                        print(f"   ⚠️ Error checking row {row_num}: {e}")
+                        continue
             
             return {
                 'eri_code': self.eri_code,
                 'location': self.location,
                 'industry': self.industry,
                 'revenue': self.revenue,
-                'years_experience': self.years_experience,
+                'years_experience': self.years_experience or 'N/A',
                 'data_type': self.data_type,
-                'all_incumbent_average': extracted_values['all_incumbent_average'],
-                'mean_value': extracted_values['mean_value'],
+                'extracted_value': result_value,
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
             
@@ -356,36 +469,258 @@ class ERICompleteAutomation:
             print(f"   ❌ Error extracting data: {e}")
             return None
 
-    def save_to_csv(self, data):
-        """Save extracted data to CSV file"""
-        if not data:
+    def save_to_csv(self, data_list):
+        """Save extracted data to CSV file - supports single item or list"""
+        if not data_list:
             return
+        
+        # Ensure we have a list
+        if not isinstance(data_list, list):
+            data_list = [data_list]
             
         try:
-            filename = f"eri_extracted_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            if not self.csv_filename:
+                self.csv_filename = f"eri_multi_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             
-            with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-                fieldnames = [ 'ERI Job Code', 'ERI Location', 'Revenue', 'Industry' ,
-                            'Years of Experience', 'Output', 'all_incumbent_average', 'mean_value']
+            # Check if file exists to determine if we need headers
+            file_exists = os.path.exists(self.csv_filename)
+            
+            with open(self.csv_filename, 'a', newline='', encoding='utf-8') as csvfile:
+                fieldnames = ['ERI Job Code', 'ERI Location', 'Revenue', 'Industry',
+                            'Years of Experience', 'Output', 'Extracted Value']
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 
-                writer.writeheader()
-                writer.writerow({
-                    # 'timestamp': data['timestamp'],
-                    'ERI Job Code': data['eri_code'],
-                    'ERI Location': data['location'],
-                    'Industry': data['industry'],
-                    'Revenue': data['revenue'],
-                    'Years of Experience': data['years_experience'],
-                    'Output': data['data_type'],
-                    'all_incumbent_average': data['all_incumbent_average'],
-                    'mean_value': data['mean_value']
-                })
+                # Write header only if file is new
+                if not file_exists:
+                    writer.writeheader()
+                
+                # Write all data rows
+                for data in data_list:
+                    writer.writerow({
+                        'ERI Job Code': data['eri_code'],
+                        'ERI Location': data['location'],
+                        'Industry': data['industry'],
+                        'Revenue': data['revenue'],
+                        'Years of Experience': data['years_experience'],
+                        'Output': data['data_type'],
+                        'Extracted Value': data['extracted_value']
+                    })
             
-            print(f"📄 Data saved to: {filename}")
+            print(f"📄 Data saved to: {self.csv_filename}")
             
         except Exception as e:
             print(f"❌ Error saving to CSV: {e}")
+
+    def save_complete_results(self, input_csv_path, all_rows, extracted_data):
+        """Save complete results combining existing answers with newly extracted data"""
+        try:
+            # Create output filename
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_filename = f"eri_complete_results_{timestamp}.csv"
+            
+            print(f"\n📄 Saving complete results to: {output_filename}")
+            
+            with open(output_filename, 'w', newline='', encoding='utf-8') as csvfile:
+                fieldnames = ['ERI Code', 'ERI Location', 'Revenue', 'Industry',
+                            'Years of Experience', 'Requested Type', 'Answer', 'Status']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                for row in all_rows:
+                    # Determine the answer for this row
+                    row_index = row['row_index']
+                    if row_index in extracted_data:
+                        # Newly extracted data
+                        answer = extracted_data[row_index]
+                        status = "Newly Extracted"
+                    elif row['existing_answer'] not in ['Not Available', '', 'NaN', 'nan']:
+                        # Existing answer
+                        answer = row['existing_answer']
+                        status = "Pre-existing"
+                    else:
+                        # No data available
+                        answer = "Not Available"
+                        status = "No Data"
+                    
+                    writer.writerow({
+                        'ERI Code': row['eri_code'],
+                        'ERI Location': row['location'],
+                        'Revenue': row['revenue'],
+                        'Industry': row['industry'],
+                        'Years of Experience': row['years_experience'],
+                        'Requested Type': row['data_type'],
+                        'Answer': answer,
+                        'Status': status
+                    })
+            
+            # Also update the original input CSV with new answers
+            self.update_input_csv(input_csv_path, all_rows, extracted_data)
+            
+            print(f"✅ Complete results saved to: {output_filename}")
+            print(f"✅ Updated input CSV: {input_csv_path}")
+            
+            # Show summary
+            existing_count = len([r for r in all_rows if r['existing_answer'] not in ['Not Available', '', 'NaN', 'nan']])
+            extracted_count = len(extracted_data)
+            failed_count = len(all_rows) - existing_count - extracted_count
+            
+            print(f"\n📊 Summary:")
+            print(f"   ✅ Pre-existing answers: {existing_count}")
+            print(f"   🔄 Newly extracted: {extracted_count}")
+            print(f"   ❌ Failed/No data: {failed_count}")
+            print(f"   📈 Total coverage: {existing_count + extracted_count}/{len(all_rows)} rows")
+            
+        except Exception as e:
+            print(f"❌ Error saving complete results: {e}")
+
+    def update_input_csv(self, csv_path, all_rows, extracted_data):
+        """Update the input CSV file with newly extracted answers"""
+        try:
+            # Read the original CSV to preserve structure
+            updated_rows = []
+            
+            with open(csv_path, 'r', newline='', encoding='utf-8') as csvfile:
+                reader = csv.DictReader(csvfile)
+                fieldnames = reader.fieldnames
+                
+                for i, row in enumerate(reader):
+                    # Update answer if we extracted new data for this row
+                    if i in extracted_data:
+                        row['Answer'] = extracted_data[i]
+                    updated_rows.append(row)
+            
+            # Write back the updated data
+            with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(updated_rows)
+                
+        except Exception as e:
+            print(f"❌ Error updating input CSV: {e}")
+
+    def run_subsequent_automation(self, row_data):
+        """Run automation for subsequent rows (starting from step 2)"""
+        print(f"\n" + "="*60)
+        print(f"🎯 Processing Row: ERI {row_data['eri_code']} - {row_data['data_type']}")
+        print("="*60)
+        
+        # Set the data for this row
+        self.eri_code = row_data['eri_code']
+        self.location = row_data['location']
+        self.revenue = row_data['revenue']
+        self.industry = row_data['industry']
+        self.years_experience = row_data['years_experience']
+        self.data_type = row_data['data_type']
+        
+        try:
+            # CRITICAL: Scroll to top of page and refresh page state
+            print("\n📍 RESET: Scrolling to top and refreshing page state")
+            self.driver.execute_script("window.scrollTo(0, 0);")
+            time.sleep(2)
+            
+            # Try to close any open dropdowns or modals first
+            try:
+                self.driver.execute_script("document.body.click();")
+                time.sleep(1)
+            except:
+                pass
+            
+            print("   ✅ Page reset completed")
+            
+            # Step 2: Click second button (START FROM STEP 2, NOT STEP 3!)
+            print("\n📍 STEP 2: Click second button")
+            if not self.wait_and_click("/html/body/div[1]/div[3]/div[1]/div/div[1]/div/div/div[2]/div/div[2]/button", "Step 2: Second button"):
+                return False
+            time.sleep(6)  # Wait for page transition
+            
+            # Step 3: Click dropdown button
+            print("\n📍 STEP 3: Click dropdown button")
+            if not self.wait_and_click("/html/body/div[53]/div/div[3]/table/tbody/tr/td[1]/div[2]/span/span", "Step 3: Dropdown button"):
+                return False
+            time.sleep(2)
+            # Step 4: Select 'ERI Code' using keyboard navigation
+            print("\n📍 STEP 4: Select 'ERI Code' using keyboard navigation")
+            if not self.dropdown_keyboard_selection():
+                return False
+
+            # Step 5: Type ERI Code
+            print(f"\n📍 STEP 5: Type ERI Code '{self.eri_code}'")
+            try:
+                input_element = self.wait.until(EC.element_to_be_clickable(
+                    (By.XPATH, "/html/body/div[53]/div/div[3]/table/tbody/tr/td[1]/div[1]/div[2]/input")
+                ))
+                print("   ✅ Element found")
+                
+                # Clear and type
+                input_element.clear()
+                input_element.send_keys(self.eri_code)
+                print("   ✅ Successfully typed ERI Code")
+            except Exception as e:
+                print(f"   ❌ Error typing ERI Code: {e}")
+                return False
+
+            # Step 6: Click confirmation button
+            print("\n📍 STEP 6: Click confirmation button")
+            time.sleep(2)
+            step6_xpath = "/html/body/div[53]/div/div[4]/div/div[2]/button[2]"
+            try:
+                element = self.wait.until(EC.element_to_be_clickable((By.XPATH, step6_xpath)))
+                print("   ✅ Element found")
+                
+                try:
+                    element.click()
+                    print("   ✅ Standard click successful")
+                except Exception:
+                    print("   ⚠️  Standard click failed, trying JavaScript...")
+                    self.driver.execute_script("arguments[0].click();", element)
+                    print("   ✅ JavaScript click successful")
+            except Exception as e:
+                print(f"   ❌ Error clicking confirmation button: {e}")
+                return False
+            
+            time.sleep(3)
+
+            # Step 7: Type Location
+            print(f"\n📍 STEP 7: Type Location '{self.location}'")
+            if not self.type_and_enter("/html/body/div[1]/div[3]/div[1]/div/div[1]/div/div/div[36]/div[1]/div[1]/div[1]/div/input", 
+                                     self.location, f"Location: {self.location}"):
+                return False
+
+            # Step 8: Type Industry
+            print(f"\n📍 STEP 8: Type Industry '{self.industry}'")
+            if not self.type_and_enter("/html/body/div[1]/div[3]/div[1]/div/div[1]/div/div/div[38]/div[2]/div[1]/input[2]", 
+                                     self.industry, f"Industry: {self.industry}"):
+                return False
+
+            # Step 9: Type Revenue
+            print(f"\n📍 STEP 9: Type Revenue '{self.revenue}'")
+            if not self.type_and_enter("/html/body/div[1]/div[3]/div[1]/div/div[1]/div/div/div[40]/div[2]/div[1]/div[1]/input", 
+                                     self.revenue, f"Revenue: {self.revenue}"):
+                return False
+
+            time.sleep(3)
+            print(f"\n🎉 Steps 3-9 completed for ERI {self.eri_code}!")
+            
+            # Extract data
+            data = self.extract_years_experience_data()
+            if data:
+                self.all_data.append(data)
+                print(f"✅ Row completed: {data['extracted_value']}")
+                
+                # Scroll to top after data extraction to prepare for next row
+                print("\n📍 PREPARATION: Scrolling to top for next row")
+                self.driver.execute_script("window.scrollTo(0, 0);")
+                time.sleep(2)
+                print("   ✅ Ready for next row")
+                
+                return True
+            else:
+                print("❌ Data extraction failed")
+                return False
+            
+        except Exception as e:
+            print(f"❌ Error in subsequent automation: {e}")
+            return False
 
     def run_complete_automation(self):
         """Run the complete 9-step automation with data extraction"""
@@ -405,12 +740,12 @@ class ERICompleteAutomation:
             print("\n📍 STEP 2: Click second button")
             if not self.wait_and_click("/html/body/div[1]/div[3]/div[1]/div/div[1]/div/div/div[2]/div/div[2]/button", "Step 2: Second button"):
                 return False
-            time.sleep(4)
+            time.sleep(6)
             # self.screenshot("after_step_2")
             
             # Step 3: Click dropdown button
             print("\n📍 STEP 3: Click dropdown button")
-            if not self.wait_and_click("/html/body/div[59]/div/div[3]/table/tbody/tr/td[1]/div[2]/span/span", "Step 3: Dropdown button"):
+            if not self.wait_and_click("/html/body/div[53]/div/div[3]/table/tbody/tr/td[1]/div[2]/span/span", "Step 3: Dropdown button"):
                 return False
             time.sleep(2)
             # self.screenshot("after_step_3")
@@ -424,7 +759,7 @@ class ERICompleteAutomation:
             print(f"\n📍 STEP 5: Type ERI Code '{self.eri_code}'")
             try:
                 input_element = self.wait.until(EC.element_to_be_clickable(
-                    (By.XPATH, "/html/body/div[59]/div/div[3]/table/tbody/tr/td[1]/div[1]/div[2]/input")
+                    (By.XPATH, "/html/body/div[53]/div/div[3]/table/tbody/tr/td[1]/div[1]/div[2]/input")
                 ))
                 print("   ✅ Element found")
                 
@@ -440,7 +775,7 @@ class ERICompleteAutomation:
             # Step 6: Click confirmation button (FIXED with JavaScript click)
             print("\n📍 STEP 6: Click confirmation button")
             time.sleep(2)  # Wait for input to register
-            step6_xpath = "/html/body/div[59]/div/div[4]/div/div[2]/button[2]"
+            step6_xpath = "/html/body/div[53]/div/div[4]/div/div[2]/button[2]"
             
             try:
                 # First try to find the element
@@ -498,7 +833,13 @@ class ERICompleteAutomation:
             # Extract data
             data = self.extract_years_experience_data()
             if data:
-                self.save_to_csv(data)
+                self.all_data.append(data)
+                
+            # Scroll to top after data extraction to prepare for next row
+            print("\n📍 PREPARATION: Scrolling to top for next row")
+            self.driver.execute_script("window.scrollTo(0, 0);")
+            time.sleep(2)
+            print("   ✅ Ready for next row")
                 
             return True
             
@@ -507,54 +848,84 @@ class ERICompleteAutomation:
             # self.screenshot("automation_error")
             return False
 
-def main():
-    # Hardcoded input for testing
-    user_input = 'ERI Code=4006, ERI Location=Dallas, Texas, Revenue=565000000, Industry=All Industries - Diversified, Years of Experience=11, 75th Percentile'
-    
-    print("🎯 ERI Complete Automation with Data Extraction")
-    print("="*60)
-    print("🔑 Using fresh cookies.json")
-    print("📋 Input:", user_input)
-    
-    automation = ERICompleteAutomation()
-    
-    try:
-        # Parse input
-        if not automation.parse_user_input(user_input):
-            print("❌ Failed to parse input")
+    def run_multi_automation(self, csv_file_path="input_data.csv"):
+        """Main function to process multiple rows from CSV file - SMART MODE"""
+        print("🎯 ERI Smart Multi-Input Automation (CSV Mode)")
+        print("="*60)
+        
+        # Read data from CSV file and identify what needs processing
+        all_rows, rows_to_process = self.read_csv_input(csv_file_path)
+        if not all_rows:
+            print("❌ No rows found in CSV file")
+            return
+            
+        if not rows_to_process:
+            print("🎉 All rows already have answers! No processing needed.")
             return
         
-        # Start browser
-        print("\n🚀 Starting browser with fresh cookies...")
-        driver, login_success = login_with_selenium("cookies.json")
-        
-        if driver:
-            automation.driver = driver
-            automation.wait = WebDriverWait(driver, 15)
-            automation.actions = ActionChains(driver)
+        try:
+            # Start browser only if we have rows to process
+            print(f"\n🚀 Starting browser to process {len(rows_to_process)} rows...")
+            driver, login_success = login_with_selenium("cookies.json")
             
-            # Run complete automation
-            success = automation.run_complete_automation()
-            
-            if success:
-                print("\n✅ Complete automation finished successfully!")
-                print("📄 Check the CSV file for extracted data")
-            else:
-                print("\n❌ Automation encountered errors")
+            if driver:
+                self.driver = driver
+                self.wait = WebDriverWait(driver, 15)
+                self.actions = ActionChains(driver)
                 
-        else:
-            print("❌ Failed to start browser session")
-            
-    except Exception as e:
-        print(f"❌ Error in main: {e}")
-        
-    finally:
-        print("\n💡 Browser will stay open for inspection.")
-        print("🔒 Session preserved - check CSV file for results.")
-        input("Press Enter when ready to close browser...")
-        
-        if automation.driver:
-            automation.driver.quit()
+                # Process rows that need data extraction
+                extracted_data = {}  # Store by row_index
+                
+                for i, row in enumerate(rows_to_process):
+                    print(f"\n🚀 Processing Row {row['row_index'] + 1}: ERI {row['eri_code']}")
+                    
+                    # Set data for this row
+                    self.eri_code = row['eri_code']
+                    self.location = row['location']
+                    self.revenue = row['revenue']
+                    self.industry = row['industry']
+                    self.years_experience = row['years_experience']
+                    self.data_type = row['data_type']
+                    
+                    # Process first row with complete automation, subsequent with step 2
+                    if i == 0:
+                        print("   🎯 Using complete automation (Steps 1-9)")
+                        success = self.run_complete_automation()
+                    else:
+                        print("   🎯 Using subsequent automation (Steps 2-9)")
+                        success = self.run_subsequent_automation(row)
+                    
+                    if success and self.all_data:
+                        # Get the latest extracted data
+                        latest_data = self.all_data[-1]
+                        extracted_data[row['row_index']] = latest_data['extracted_value']
+                        print(f"✅ Row {row['row_index'] + 1} completed: {latest_data['extracted_value']}")
+                    else:
+                        print(f"❌ Row {row['row_index'] + 1} failed")
+                        extracted_data[row['row_index']] = "Extraction Failed"
+                
+                # Combine existing answers with newly extracted data
+                self.save_complete_results(csv_file_path, all_rows, extracted_data)
+                
+            else:
+                print("❌ Failed to start browser session")
+                
+        except Exception as e:
+            print(f"❌ Error in smart multi-automation: {e}")
+        finally:
+            print("\n💡 Browser will stay open for inspection.")
+            input("Press Enter when ready to close browser...")
+            if self.driver:
+                self.driver.quit()
+
+def main():
+    print("🎯 ERI Multi-Row Automation (CSV Input)")
+    print("="*60)
+    print("🔑 Using fresh cookies.json")
+    print("📋 Reading input from input_data.csv")
+    
+    automation = ERICompleteAutomation()
+    automation.run_multi_automation("input_data.csv")
 
 if __name__ == "__main__":
     main()
